@@ -35,7 +35,6 @@ TEST_URLS = [
 ]
 
 # Timeout configuration
-# Höhere Timeouts sorgen dafür, dass nicht zu viele Proxys vorschnell als "unbrauchbar" aussortiert werden.
 TIMEOUT = (5, 10)  # (Connect timeout, Read timeout)
 
 # Max threads for testing
@@ -61,10 +60,19 @@ def log_success(message):
 def get_proxies_from_source(key):
     """
     Lädt und parst Proxys von einer einzelnen Quelle.
-    Diese Funktion wird parallel von get_proxies() aufgerufen.
+    Gibt eine Liste von Dictionaries zurück, z.B.:
+    [
+      {
+        "ip": "1.2.3.4",
+        "port": "8080",
+        "protocol": "http"|"https"|"socks4"|"socks5",
+        "country": "US"
+      },
+      ...
+    ]
     """
     name, url = PROXY_SOURCES[key]
-    collected = []
+    proxy_dicts = []
     log_info(f"Fetching proxies from {name} ({url})")
 
     try:
@@ -72,69 +80,97 @@ def get_proxies_from_source(key):
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
 
-        # Geonode liefert eine JSON-Antwort, also JSON parsen
+        # ============== Geonode (JSON) ==============
         if "geonode" in url:
             data = response.json()
             if "data" in data:
                 for entry in data["data"]:
-                    ip = entry.get("ip", "")
-                    port = entry.get("port", "")
-                    # Protokoll prüfen
+                    ip = entry.get("ip", "").strip()
+                    port = str(entry.get("port", "")).strip()
                     protocol_list = entry.get("protocols", [])
-                    # Fallback http, wenn nichts angegeben
-                    if protocol_list:
-                        # Nimm am besten das erste vorhandene Protokoll oder du erweiterst die Schleife
-                        protocol = protocol_list[0]
-                    else:
-                        protocol = "http"
+                    country_code = entry.get("country", "??").strip()  # z.B. "US"
+
+                    # Falls Protokoll unklar, Standard = http
+                    protocol = protocol_list[0] if protocol_list else "http"
+
                     if ip and port:
-                        collected.append(f"{protocol}://{ip}:{port}")
+                        proxy_dicts.append({
+                            "ip": ip,
+                            "port": port,
+                            "protocol": protocol,
+                            "country": country_code
+                        })
             else:
-                # Fallback: falls geonode anders reagiert
                 log_warning("Geonode response has no 'data' field.")
-                # Du kannst hier optional den alten Weg probieren
-                # oder das Skript abbrechen.
-            return collected
+            return proxy_dicts
 
-        # Für Proxy-Listen, die nur Rohtext liefern
+        # ============== API/Plain Text ==============
         if "api/v1/get" in url or "proxyscrape.com" in url:
-            collected.extend(response.text.strip().split("\n"))
-            return collected
+            # Hier gibt's nur IP:Port => Kein Country-Code, Protokoll unbekannt => Standard = http
+            lines = response.text.strip().split("\n")
+            for line in lines:
+                line = line.strip()
+                if ":" in line:
+                    ip_port = line.split(":")
+                    if len(ip_port) == 2:
+                        ip, port = ip_port
+                        proxy_dicts.append({
+                            "ip": ip.strip(),
+                            "port": port.strip(),
+                            "protocol": "http",  # oder "socks4"/"socks5" - hier bräuchte man Parser-Logik
+                            "country": "??"
+                        })
+            return proxy_dicts
 
-        # Standard-Fall: HTML-Parsing
+        # ============== HTML-Parsing (Tabellen) ==============
         soup = BeautifulSoup(response.text, "html.parser")
         table = soup.find("table")
 
         if table:
-            rows = table.find_all("tr")[1:]
+            rows = table.find_all("tr")[1:]  # Erste Zeile ist Header
             for row in rows:
                 cols = row.find_all("td")
-                if cols:
+                if len(cols) >= 2:
+                    # IP und Port
                     ip = cols[0].text.strip()
                     port = cols[1].text.strip()
-                    # Hier kannst du prüfen, ob die Spalte für HTTPS existiert:
-                    if len(cols) > 6:
-                        https = cols[6].text.strip().lower() == "yes"
-                        protocol = "https" if https else "http"
+
+                    # Sofern vorhanden: Spalte 2 => Landeskürzel (Code)
+                    if len(cols) >= 3:
+                        country_code = cols[2].text.strip()
+                    else:
+                        country_code = "??"
+
+                    # Spalte 6 oder 7 => HTTPS 'yes'/'no' => muss je nach Quelle geprüft werden
+                    # Free-proxy-list hat das in Spalte 6
+                    # SSL-Proxies hat das in Spalte 6
+                    https_col_index = 6  # kann je nach HTML abweichen
+                    if len(cols) > https_col_index:
+                        https_flag = cols[https_col_index].text.strip().lower() == "yes"
+                        protocol = "https" if https_flag else "http"
                     else:
                         protocol = "http"
-                    proxy = f"{protocol}://{ip}:{port}"
-                    collected.append(proxy)
 
+                    proxy_dicts.append({
+                        "ip": ip,
+                        "port": port,
+                        "protocol": protocol,
+                        "country": country_code
+                    })
     except requests.RequestException as e:
         log_warning(f"Could not fetch proxies from {name}: {e}")
 
-    return collected
+    return proxy_dicts
 
 
 def get_proxies(sources):
     """
-    Holt die Proxys von den ausgewählten Quellen.
-    Nutzt Parallelisierung für schnelleres Einlesen.
+    Holt die Proxys von den ausgewählten Quellen (parallel).
+    Gibt eine Liste von Dictionaries zurück.
     """
-    # Paralleles Abfragen der Quellen, um die Gesamt-Ladezeit zu verkürzen
     all_proxies = []
 
+    # Parallelisieren, um schneller alle Quellen abzufragen
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(sources), 10)) as executor:
         future_to_source = {executor.submit(get_proxies_from_source, key): key for key in sources}
         for future in concurrent.futures.as_completed(future_to_source):
@@ -145,46 +181,69 @@ def get_proxies(sources):
             except Exception as exc:
                 log_warning(f"Source {source_key} generated an exception: {exc}")
 
-    # Duplikate entfernen
-    all_proxies = list(set(all_proxies))
+    # Duplikate entfernen:
+    # Da es jetzt Dictionaries sind, müssen wir sie in ein "hashbares" Format wandeln
+    # (z.B. tuple), um Duplikate rauszufiltern.
+    unique_set = set()
+    unique_proxies = []
+    for prx in all_proxies:
+        # Erstelle ein Tuple (ip, port, protocol, country)
+        prx_tuple = (prx["ip"], prx["port"], prx["protocol"], prx["country"])
+        if prx_tuple not in unique_set:
+            unique_set.add(prx_tuple)
+            unique_proxies.append(prx)
 
-    # Eventuell schon mal mischen, um nicht in Listen-Blöcken zu testen
-    random.shuffle(all_proxies)
+    # Für besseren Proxy-Mix:
+    random.shuffle(unique_proxies)
+
+    log_success(f"🔍 Found {len(unique_proxies)} proxies! 🎉")
+    return unique_proxies
+
+
+def test_proxy(proxy_dict):
+    """
+    Testet einen Proxy mit mehreren URLs.
+    proxy_dict = {"ip":..., "port":..., "protocol":..., "country":...}
+    Gibt das Dictionary zurück, wenn erfolgreich, sonst None.
     
-    log_success(f"🔍 Found {len(all_proxies)} proxies! 🎉")
-    return all_proxies
-
-
-def test_proxy(proxy):
+    Hinweis: Wir akzeptieren den Proxy schon, 
+    wenn ER EINE der Test-URLs erfolgreich aufrufen kann.
     """
-    Testet einen Proxy, indem wir mehrere Webseiten prüfen.
-    Anmerkung: Hier ist es so konfiguriert, dass EIN erfolgreicher Seitenaufruf ausreicht.
-    Wenn du möchtest, dass ALLE URLs funktionieren müssen, passe die Logik an.
-    """
+    proxy_str = f"{proxy_dict['protocol']}://{proxy_dict['ip']}:{proxy_dict['port']}"
     headers = {"User-Agent": ua.random}
+
     for url in TEST_URLS:
         try:
-            response = requests.get(url, proxies={"http": proxy, "https": proxy}, headers=headers, timeout=TIMEOUT)
-            # Wenn eine Seite 200 zurückgibt, akzeptieren wir den Proxy als funktionsfähig
+            response = requests.get(
+                url,
+                proxies={"http": proxy_str, "https": proxy_str},
+                headers=headers,
+                timeout=TIMEOUT
+            )
+            # Bei erstem Erfolg beenden
             if response.status_code == 200:
-                return proxy
+                return proxy_dict
         except requests.RequestException:
-            # Bei Fehler: Teste die nächste URL
             continue
-    # Keine URL war erfolgreich -> None
+
     return None
 
 
-def save_proxies(proxies):
-    """Speichert funktionsfähige Proxies in eine Datei mit Zeitstempel."""
+def save_proxies(proxy_list):
+    """
+    Speichert funktionsfähige Proxies in eine Datei mit Zeitstempel.
+    Format pro Zeile:
+    <protokoll>://<ip>:<port> <country_code>
+    """
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = f"WorkingProxys_{timestamp}.txt"
 
     with open(filename, "w") as file:
-        for proxy in proxies:
-            file.write(proxy + "\n")
+        for prx in proxy_list:
+            line = f"{prx['protocol']}://{prx['ip']}:{prx['port']} {prx['country']}"
+            file.write(line + "\n")
 
-    log_success(f"{len(proxies)} working proxies saved in {filename} 📂")
+    log_success(f"{len(proxy_list)} working proxies saved in {filename} 📂")
 
 
 def choose_sources():
@@ -228,19 +287,19 @@ def main():
     log_info("🚀 Proxy Scraper & Tester started!")
     sources = choose_sources()
 
-    proxies = get_proxies(sources)
-    if not proxies:
+    proxy_list = get_proxies(sources)
+    if not proxy_list:
         log_error("No proxies found. Exiting. ❌")
         return
 
-    log_info(f"⏳ Testing {len(proxies)} proxies with {MAX_THREADS} threads...")
+    log_info(f"⏳ Testing {len(proxy_list)} proxies with {MAX_THREADS} threads...")
 
     # Proxy-Check mit ThreadPoolExecutor
-    working_proxies = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        results = list(tqdm(executor.map(test_proxy, proxies), total=len(proxies), desc="Testing Proxies"))
+        results = list(tqdm(executor.map(test_proxy, proxy_list), total=len(proxy_list), desc="Testing Proxies"))
 
-    working_proxies = [proxy for proxy in results if proxy]
+    # Nur die Proxies behalten, die nicht None sind
+    working_proxies = [prx for prx in results if prx]
 
     if working_proxies:
         save_proxies(working_proxies)
